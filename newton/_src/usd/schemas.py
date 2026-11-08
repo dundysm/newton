@@ -413,7 +413,9 @@ class SchemaResolverPhysx(SchemaResolver):
             "kd": SchemaAttribute("physxMaterial:compliantContactDamping", None),
         },
         PrimType.BODY: {
-            # Rigid body damping
+            # Inspection-only keys. No builder property applies them. Authored
+            # nonzero values warn during USD import unless a body custom
+            # attribute reads the USD name, as SolverSteel does.
             "rigid_body_linear_damping": SchemaAttribute("physxRigidBody:linearDamping", 0.0),
             "rigid_body_angular_damping": SchemaAttribute("physxRigidBody:angularDamping", 0.05),
         },

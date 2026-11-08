@@ -96,6 +96,92 @@ def _is_uniform_scale(scale, rel_tol: float = 1.0e-6) -> bool:
     return hi - lo <= rel_tol * max(abs(lo), abs(hi))
 
 
+# PhysX schema fallbacks: linear damping 0, angular damping 0.05. A finite 0 is
+# the no-damping coefficient. SolverSteel scales velocity by max(1 - c * dt, 0).
+_PHYSX_RIGID_BODY_DAMPING_USD_ATTRIBUTES = (
+    "physxRigidBody:linearDamping",
+    "physxRigidBody:angularDamping",
+)
+
+
+def _authored_physx_damping_changes_velocity(value: Any) -> bool:
+    """Return whether an authored PhysX damping coefficient would scale velocity.
+
+    A finite coefficient of 0 leaves velocity unchanged. Non-numeric and
+    non-finite authored values are not that no-op. ``bool`` is rejected
+    because it is a Python ``int`` subclass.
+    """
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        coefficient = float(value)
+    except (TypeError, ValueError):
+        return True
+    return not (math.isfinite(coefficient) and coefficient == 0.0)
+
+
+def _format_authored_damping(value: Any) -> str:
+    """Format an authored damping value for a stable warning message.
+
+    Six significant digits hide the binary expansion of a USD ``float`` while
+    keeping distinct coefficients distinct. ``0.01`` stays ``0.01``.
+    """
+    if isinstance(value, bool):
+        return repr(value)
+    try:
+        coefficient = float(value)
+    except (TypeError, ValueError):
+        return repr(value)
+    return format(coefficient, ".6g")
+
+
+def _body_custom_attribute_reads_usd_attribute(attributes, usd_name: str) -> bool:
+    """Return whether a body custom attribute imports this exact USD name.
+
+    A ``usd_attribute_name`` of ``"*"`` or ``None`` does not consume the
+    attribute. ``SolverSteel.register_custom_attributes()`` registers the
+    exact PhysX names.
+    """
+    return any(getattr(attribute, "usd_attribute_name", None) == usd_name for attribute in attributes)
+
+
+def _warn_dropped_physx_rigid_body_damping(
+    prim,
+    path: str,
+    body_custom_attributes,
+    already_warned: set[str],
+) -> None:
+    """Warn when authored PhysX rigid-body damping is dropped on import.
+
+    Unauthored attributes are not reported, including the angular schema
+    fallback of 0.05. An authored finite 0 is not reported because it does
+    not change velocity. A body custom attribute whose ``usd_attribute_name``
+    is the PhysX attribute consumes that value. The warning identifies the
+    dropped authoring; it does not add damping or joint damping.
+    """
+    if path in already_warned or prim is None:
+        return
+    dropped: list[str] = []
+    for usd_name in _PHYSX_RIGID_BODY_DAMPING_USD_ATTRIBUTES:
+        if _body_custom_attribute_reads_usd_attribute(body_custom_attributes, usd_name):
+            continue
+        value = usd.get_attribute(prim, usd_name)
+        if not _authored_physx_damping_changes_velocity(value):
+            continue
+        dropped.append(f"{usd_name}={_format_authored_damping(value)}")
+    if not dropped:
+        return
+    already_warned.add(path)
+    rendered = ", ".join(dropped)
+    warnings.warn(
+        f"Rigid body prim {path}: ignoring authored {rendered}. "
+        "Newton does not import PhysX rigid-body damping unless a body custom "
+        "attribute reads that USD attribute. The imported body keeps undamped dynamics.",
+        NewtonWarning,
+        stacklevel=_external_warning_stacklevel(),
+    )
+
+
 def _warn_mirrored_body_transform(usd_prim, key: str, xform_cache) -> None:
     """Warn when a rigid body prim has an improper (mirrored) world transform.
 
@@ -1123,6 +1209,8 @@ def parse_usd(
             _load_visual_shape_children(b, prim, xform, articulation_root_xform, load_visual_shapes)
         return b
 
+    warned_physx_rigid_body_damping: set[str] = set()
+
     def parse_body(
         rigid_body_desc: UsdPhysics.RigidBodyDesc,
         prim: Usd.Prim,
@@ -1148,6 +1236,12 @@ def parse_usd(
                 origin = wp.mul(incoming_xform, origin)
         path = str(prim.GetPath())
         _warn_mirrored_body_transform(prim, path, xform_cache)
+        _warn_dropped_physx_rigid_body_damping(
+            prim,
+            path,
+            builder_custom_attr_body,
+            warned_physx_rigid_body_damping,
+        )
 
         is_kinematic = rigid_body_desc.kinematicBody
         linear_velocity = wp.transform_vector(origin, wp.vec3(*rigid_body_desc.linearVelocity))

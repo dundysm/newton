@@ -853,6 +853,40 @@ for these prims. Newton's existing hull reduction applies that vertex limit to e
 output hull. Disconnected components remain separate; the result need not match
 PhysX cooking.
 
+**PhysX rigid-body damping:**
+
+``physxRigidBody:linearDamping`` and ``physxRigidBody:angularDamping`` are not
+imported as Newton body or joint properties. The PhysX schema fallback is 0
+for linear damping and 0.05 for angular damping, with range ``[0, inf)``.
+A finite coefficient of 0 does not change velocity:
+:class:`~newton.solvers.SolverSteel` scales free-body velocity by
+``max(1 - coefficient * dt, 0)``.
+
+:meth:`newton.ModelBuilder.add_usd` emits a
+:class:`~newton.exceptions.NewtonWarning` when an imported rigid
+body authors a coefficient other than a finite 0,
+and no body custom attribute reads that USD attribute. One warning names the
+prim and each dropped attribute. The warning reports the silent import loss
+only. It does not apply damping, write :attr:`~newton.Model.joint_damping`, or
+make :class:`~newton.solvers.SolverMuJoCo` decay velocity.
+
+The importer does not warn for:
+
+* an unauthored attribute, including the angular schema fallback of 0.05, which
+  is not invented at import;
+* an authored finite 0, the PhysX no-damping coefficient;
+* a body skipped by ``ignore_paths`` or ``only_load_enabled_rigid_bodies``;
+* a coefficient read by a registered body custom attribute whose
+  ``usd_attribute_name`` is that attribute. A wildcard ``"*"`` reader does not
+  count. Call :meth:`newton.solvers.SolverSteel.register_custom_attributes`
+  before ``add_usd()`` to import the values into ``model.steel``. Steel applies
+  them to free bodies and floating bases. That registration does not make any
+  other solver damp the body.
+
+:class:`~newton.usd.SchemaResolverPhysx` still maps the attributes to the
+unused keys ``rigid_body_linear_damping`` and ``rigid_body_angular_damping``.
+The builder does not apply those keys.
+
 **Newton articulation remapping:**
 
 On articulation root prims (with ``PhysicsArticulationRootAPI`` or ``NewtonArticulationRootAPI``) and cable ``BasisCurves`` prims, the following is resolved:

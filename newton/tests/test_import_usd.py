@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import posixpath
+import re
 import tempfile
 import types
 import unittest
@@ -33,6 +34,7 @@ from newton._src.solvers.mujoco.constants import (
 from newton._src.solvers.mujoco.utils import MjcEqualityTargetKind
 from newton._src.usd import utils as usd_utils
 from newton._src.utils.color import color_linear_to_srgb
+from newton.exceptions import NewtonWarning
 from newton.math import quat_between_axes
 from newton.solvers import SolverMuJoCo
 from newton.tests._usd_import_test_utils import _expect_jointless_articulation_warning
@@ -99,6 +101,180 @@ class TestImportUsdPhysics(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, rf"{attribute}.*shape {shape}.*/World/Invalid.*finite"):
                         builder.finalize(device="cpu")
             usd_attr.Set(original)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_physx_rigid_body_damping_warns_when_import_drops_it(self):
+        """Warn when authored nonzero PhysX rigid-body damping is dropped on import.
+
+        A finite coefficient of 0 is PhysX's no-damping value and is not reported.
+        Unauthored attributes are not reported, including the 0.05 angular schema
+        fallback. A body custom attribute that reads the USD attribute imports that
+        value and suppresses its warning. The warning does not write joint damping.
+        """
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        def make_stage(attributes, *, enabled=True, path="/cube"):
+            stage = Usd.Stage.CreateInMemory()
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+            UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+            UsdPhysics.Scene.Define(stage, "/physicsScene").CreateGravityMagnitudeAttr(0.0)
+            cube = UsdGeom.Cube.Define(stage, path)
+            cube.CreateSizeAttr(0.5)
+            cube.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 1.0))
+            prim = cube.GetPrim()
+            body = UsdPhysics.RigidBodyAPI.Apply(prim)
+            body.CreateRigidBodyEnabledAttr(enabled)
+            UsdPhysics.CollisionAPI.Apply(prim)
+            UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(10.0)
+            prim.AddAppliedSchema("PhysxRigidBodyAPI")
+            for name, value in attributes.items():
+                prim.CreateAttribute(name, Sdf.ValueTypeNames.Float).Set(value)
+            return stage
+
+        def damping_warnings(caught):
+            return [
+                warning
+                for warning in caught
+                if issubclass(warning.category, NewtonWarning) and "PhysX rigid-body damping" in str(warning.message)
+            ]
+
+        def import_stage(stage, **kwargs):
+            builder = newton.ModelBuilder()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", NewtonWarning)
+                builder.add_usd(stage, load_visual_shapes=False, load_sites=False, **kwargs)
+            return builder, damping_warnings(caught)
+
+        def register_reader(builder, usd_name, name, *, wildcard=False):
+            builder.add_custom_attribute(
+                newton.ModelBuilder.CustomAttribute(
+                    name=name,
+                    namespace="import_test",
+                    frequency=newton.Model.AttributeFrequency.BODY,
+                    dtype=wp.float32,
+                    default=0.0,
+                    usd_attribute_name="*" if wildcard else usd_name,
+                    usd_value_transformer=(lambda _value, _context: 1.0) if wildcard else None,
+                )
+            )
+
+        cases = (
+            (
+                "linear",
+                {"physxRigidBody:linearDamping": 5.0},
+                ("physxRigidBody:linearDamping=5",),
+                ("physxRigidBody:angularDamping",),
+            ),
+            (
+                "angular",
+                {"physxRigidBody:angularDamping": 2.0},
+                ("physxRigidBody:angularDamping=2",),
+                ("physxRigidBody:linearDamping",),
+            ),
+            (
+                "both",
+                {"physxRigidBody:linearDamping": 5.0, "physxRigidBody:angularDamping": 2.0},
+                ("physxRigidBody:linearDamping=5", "physxRigidBody:angularDamping=2"),
+                (),
+            ),
+            (
+                "unauthored",
+                {},
+                (),
+                ("physxRigidBody:linearDamping", "physxRigidBody:angularDamping"),
+            ),
+            (
+                "authored zeros",
+                {"physxRigidBody:linearDamping": 0.0, "physxRigidBody:angularDamping": 0.0},
+                (),
+                ("ignoring authored",),
+            ),
+            (
+                "authored angular schema fallback",
+                {"physxRigidBody:angularDamping": 0.05},
+                ("physxRigidBody:angularDamping=0.05",),
+                ("physxRigidBody:linearDamping",),
+            ),
+            (
+                "negative",
+                {"physxRigidBody:linearDamping": -1.5},
+                ("physxRigidBody:linearDamping=-1.5",),
+                ("physxRigidBody:angularDamping",),
+            ),
+        )
+        for name, attributes, present, absent in cases:
+            with self.subTest(case=name):
+                builder, caught = import_stage(make_stage(attributes))
+                self.assertEqual(builder.body_count, 1)
+                self.assertTrue(all(value == 0.0 for value in builder.joint_damping))
+                if present:
+                    self.assertEqual(len(caught), 1)
+                    message = str(caught[0].message)
+                    self.assertIn("Rigid body prim /cube:", message)
+                    for fragment in present:
+                        self.assertRegex(message, re.escape(fragment) + r"(?:\.|,)")
+                    for fragment in absent:
+                        self.assertNotIn(fragment, message)
+                else:
+                    self.assertEqual(caught, [])
+
+        with self.subTest(case="disabled body is not imported"):
+            builder, caught = import_stage(
+                make_stage({"physxRigidBody:linearDamping": 5.0}, enabled=False),
+                only_load_enabled_rigid_bodies=True,
+            )
+            self.assertEqual(builder.body_count, 0)
+            self.assertEqual(caught, [])
+
+        with self.subTest(case="ignored prim is not imported"):
+            builder, caught = import_stage(
+                make_stage({"physxRigidBody:angularDamping": 2.0}),
+                ignore_paths=["/cube"],
+            )
+            self.assertEqual(builder.body_count, 0)
+            self.assertEqual(caught, [])
+
+        with self.subTest(case="registered reader imports one attribute"):
+            stage = make_stage(
+                {"physxRigidBody:linearDamping": 5.0, "physxRigidBody:angularDamping": 2.0},
+            )
+            builder = newton.ModelBuilder()
+            register_reader(builder, "physxRigidBody:linearDamping", "linear_damping")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", NewtonWarning)
+                builder.add_usd(stage, load_visual_shapes=False, load_sites=False)
+            dropped = damping_warnings(caught)
+            self.assertEqual(len(dropped), 1)
+            message = str(dropped[0].message)
+            self.assertIn("physxRigidBody:angularDamping=2", message)
+            self.assertNotIn("physxRigidBody:linearDamping", message)
+            stored = builder.custom_attributes["import_test:linear_damping"].values[0]
+            self.assertAlmostEqual(float(stored), 5.0)
+
+        with self.subTest(case="registered readers import both attributes"):
+            stage = make_stage(
+                {"physxRigidBody:linearDamping": 5.0, "physxRigidBody:angularDamping": 2.0},
+            )
+            builder = newton.ModelBuilder()
+            register_reader(builder, "physxRigidBody:linearDamping", "linear_damping")
+            register_reader(builder, "physxRigidBody:angularDamping", "angular_damping")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", NewtonWarning)
+                builder.add_usd(stage, load_visual_shapes=False, load_sites=False)
+            self.assertEqual(damping_warnings(caught), [])
+            self.assertAlmostEqual(float(builder.custom_attributes["import_test:linear_damping"].values[0]), 5.0)
+            self.assertAlmostEqual(float(builder.custom_attributes["import_test:angular_damping"].values[0]), 2.0)
+
+        with self.subTest(case="wildcard body attribute does not consume damping"):
+            stage = make_stage({"physxRigidBody:linearDamping": 5.0})
+            builder = newton.ModelBuilder()
+            register_reader(builder, "physxRigidBody:linearDamping", "wildcard", wildcard=True)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", NewtonWarning)
+                builder.add_usd(stage, load_visual_shapes=False, load_sites=False)
+            dropped = damping_warnings(caught)
+            self.assertEqual(len(dropped), 1)
+            self.assertIn("physxRigidBody:linearDamping=5", str(dropped[0].message))
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_material_binding_outside_import_root(self):
@@ -1112,8 +1288,28 @@ class TestImportUsdPhysics(unittest.TestCase):
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_visual_match_collision_shapes(self):
+        """Match visual and collision shapes, and report the humanoid's dropped damping."""
         builder = newton.ModelBuilder()
-        builder.add_usd(newton.examples.get_asset("humanoid.usda"))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", NewtonWarning)
+            builder.add_usd(newton.examples.get_asset("humanoid.usda"))
+        damping_warnings = [
+            warning
+            for warning in caught
+            if issubclass(warning.category, NewtonWarning) and "PhysX rigid-body damping" in str(warning.message)
+        ]
+        other_warnings = [warning for warning in caught if warning not in damping_warnings]
+        self.assertEqual(other_warnings, [])
+        # examples/assets/humanoid.usda authors angularDamping = 0.01 on every rigid body.
+        self.assertEqual(len(damping_warnings), 16)
+        self.assertEqual(builder.body_count, 16)
+        for warning in damping_warnings:
+            message = str(warning.message)
+            self.assertRegex(
+                message,
+                r"Rigid body prim \S+: ignoring authored physxRigidBody:angularDamping=0\.01\.",
+            )
+            self.assertNotIn("physxRigidBody:linearDamping", message)
         self.assertEqual(builder.shape_count, 38)
         self.assertEqual(builder.body_count, 16)
         visual_shape_keys = [k for k in builder.shape_label if "visuals" in k]
